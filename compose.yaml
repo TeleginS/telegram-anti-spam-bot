@@ -1,0 +1,14 @@
+services:
+  antispam:
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/data
+      - ./rules.txt:/app/rules.txt:ro
+    restart: unless-stopped
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
