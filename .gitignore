@@ -1,6 +1,7 @@
 .env
 .env.*
 !.env.example
+rules.txt
 data/
 *.db
 *.bak*
