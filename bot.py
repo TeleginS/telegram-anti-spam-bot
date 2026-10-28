@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import httpx
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -76,6 +77,11 @@ NEURO_QUESTION = {
     }
 }
 NEURO_SOURCE = "jev-neuro"
+
+# In dry-run nothing has been done yet, so the admin picks the action.
+DRY_RUN_BUTTONS = [("🗑 Удалить", "delete"), ("🔨 Удалить и забанить", "ban"),
+                   ("✅ Не спамер", "trust"), ("🤷 Ничего не делать", "ignore")]
+DRY_RUN_PROMPT = "\nНичего не сделано, выберите действие:"  # dropped from the report once an action is chosen
 
 IMAGE_PLACEHOLDER ="__ATTACHED_IMAGE__"  # replaced per model: Clef shows images before the state, Jev by reference
 CLEF_MIMES = ("image/jpeg", "image/png", "image/webp")
@@ -363,10 +369,11 @@ async def report(bot: Bot, msg: Message, p: float, source: str, verdict: str, bu
         f"Вероятность спама: {p:.0%} ({source})\n\n"
         + ("🖼 С картинкой\n" if has_image else "")
         + f"<blockquote>{html.escape((msg.text or msg.caption or '[без текста]')[:800])}</blockquote>"
+        + (DRY_RUN_PROMPT if DRY_RUN else "")
     )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=f"{a}:{msg.chat.id}:{u.id}") for t, a in buttons]]
-    )
+    keys = [InlineKeyboardButton(text=t, callback_data=f"{a}:{msg.chat.id}:{u.id}:{msg.message_id}")
+            for t, a in buttons]
+    kb = InlineKeyboardMarkup(inline_keyboard=[keys[i:i + 2] for i in range(0, len(keys), 2)])
     for admin in ADMIN_IDS:
         try:
             await bot.send_message(admin, text, reply_markup=kb, disable_web_page_preview=True)
@@ -424,14 +431,16 @@ async def moderate(msg: Message, bot: Bot, edited: bool) -> None:
             await bot.delete_message(msg.chat.id, msg.message_id)
             await bot.ban_chat_member(msg.chat.id, u.id, revoke_messages=True)
         verdict = "Удалено и забанено" + (" (в базе CAS)" if source == "CAS" else "")
-        await report(bot, msg, p, source, verdict, [("↩️ Разбанить", "unban")], has_image=bool(image))
+        await report(bot, msg, p, source, verdict, DRY_RUN_BUTTONS if DRY_RUN else [("↩️ Разбанить", "unban")],
+                     has_image=bool(image))
     elif p >= DELETE_AT:
         action = "delete"
         if not DRY_RUN:
             await bot.delete_message(msg.chat.id, msg.message_id)
         verdict = "Удалено, похоже на нейрокомментинг (реклама в профиле)" if source == NEURO_SOURCE \
             else "Удалено, похоже на спам"
-        await report(bot, msg, p, source, verdict, [("🔨 Забанить", "ban"), ("✅ Не спам", "trust")],
+        await report(bot, msg, p, source, verdict,
+                     DRY_RUN_BUTTONS if DRY_RUN else [("🔨 Забанить", "ban"), ("✅ Не спам", "trust")],
                      has_image=bool(image))
     else:
         action = "pass"
@@ -538,24 +547,52 @@ async def stats(msg: Message) -> None:
     await msg.answer(f"Режим: {mode}\nЗа 24 часа:\n" + "\n".join(lines))
 
 
-@router.callback_query(F.data.regexp(r"^(unban|ban|trust):-?\d+:\d+$"))
+async def delete_comment(bot: Bot, chat_id: int, msg_id: int) -> bool:
+    """Delete a reported message; False if it was already gone."""
+    try:
+        await bot.delete_message(chat_id, msg_id)
+        return True
+    except TelegramBadRequest as e:
+        if "not found" in e.message:
+            return False
+        raise
+
+
+# Reports sent before the message id was added to the buttons carry only chat and user.
+@router.callback_query(F.data.regexp(r"^(unban|ban|trust|delete|ignore):-?\d+:\d+(:\d+)?$"))
 async def on_button(cb: CallbackQuery, bot: Bot) -> None:
     if cb.from_user.id not in ADMIN_IDS:
         await cb.answer("Нет прав", show_alert=True)
         return
-    action, chat_id, user_id = cb.data.split(":")
+    action, chat_id, user_id, *rest = cb.data.split(":")
     chat_id, user_id = int(chat_id), int(user_id)
-    if action == "unban":
-        await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
-        set_trusted(chat_id, user_id)
-        note = "↩️ Разбанен и добавлен в доверенные"
-    elif action == "ban":
-        await bot.ban_chat_member(chat_id, user_id, revoke_messages=True)
-        note = "🔨 Забанен"
-    else:
-        set_trusted(chat_id, user_id)
-        note = "✅ Отмечен как не спамер"
-    await cb.message.edit_text(cb.message.html_text + f"\n\n<b>{note}</b> — {html.escape(cb.from_user.full_name)}")
+    msg_id = int(rest[0]) if rest else None
+    try:
+        if action == "unban":
+            await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+            set_trusted(chat_id, user_id)
+            note = "↩️ Разбанен и добавлен в доверенные"
+        elif action == "ban":
+            if msg_id and DRY_RUN:  # in live mode the bot has already deleted it
+                await delete_comment(bot, chat_id, msg_id)
+            await bot.ban_chat_member(chat_id, user_id, revoke_messages=True)
+            note = "🔨 Удалён и забанен" if msg_id and DRY_RUN else "🔨 Забанен"
+        elif action == "delete":
+            if not msg_id:
+                await cb.answer("В этом отчёте нет ссылки на сообщение", show_alert=True)
+                return
+            note = "🗑 Комментарий удалён" if await delete_comment(bot, chat_id, msg_id) \
+                else "🗑 Комментарий уже был удалён"
+        elif action == "ignore":
+            note = "🤷 Оставлено как есть"
+        else:
+            set_trusted(chat_id, user_id)
+            note = "✅ Отмечен как не спамер"
+    except TelegramAPIError as e:
+        log.warning("admin action %s failed: %s", cb.data, e)
+        await cb.answer(f"Не получилось: {e.message}", show_alert=True)
+        return
+    await cb.message.edit_text(cb.message.html_text.removesuffix(DRY_RUN_PROMPT) + f"\n\n<b>{note}</b> — {html.escape(cb.from_user.full_name)}")
     await cb.answer()
 
 
