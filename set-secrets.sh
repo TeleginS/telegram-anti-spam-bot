@@ -31,7 +31,7 @@ ask CAS_API_KEY      "Combot API key для CAS (необязательно)" 1
 ask ADMIN_IDS        "Ваш Telegram ID (несколько через запятую)" 0
 ask GROUP_DESCRIPTION "О чём группа, одной фразой (необязательно)" 0
 
-for kv in DRY_RUN=true BAN_THRESHOLD=0.9 DELETE_THRESHOLD=0.7 TRUST_AFTER=3 JEV_MODEL=jev-latest; do
+for kv in DRY_RUN=true TRUST_AFTER=3 JEV_MODEL=jev-latest; do
   grep -q "^${kv%%=*}=" "$ENVF" || echo "$kv" >> "$ENVF"
 done
 echo "Сохранено в $ENVF:"; cut -d= -f1 "$ENVF" | sed 's/^/  /'
