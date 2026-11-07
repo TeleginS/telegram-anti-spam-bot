@@ -1,7 +1,7 @@
-"""Telegram anti-spam bot: messages from untrusted members are scored by
-Cloudflare Clef-flash; while Clef is rate-limited or out of quota (or fails),
-TypeSafe Jev scores them instead. The spam probability decides whether to
-delete the message and ban the author."""
+"""Telegram anti-spam bot: messages from untrusted members get a set of
+yes/no questions (questions.py) answered by Cloudflare Clef-flash; while Clef
+is rate-limited or out of quota (or fails), TypeSafe Jev answers them instead.
+The rules in questions.decide turn the answers into ban, delete, review or pass."""
 
 import asyncio
 import base64
@@ -22,6 +22,8 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from questions import Verdict, build_questions, decide, label
+
 env = os.environ
 BOT_TOKEN = env.get("BOT_TOKEN", "")
 CF_ACCOUNT_ID = env.get("CF_ACCOUNT_ID", "")
@@ -31,8 +33,6 @@ JEV_MODEL = env.get("JEV_MODEL", "jev-latest")
 CAS_API_KEY = env.get("CAS_API_KEY", "")  # Combot API key; CAS rejects requests without one
 ADMIN_IDS = {int(x) for x in env.get("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 GROUP_DESCRIPTION = env.get("GROUP_DESCRIPTION", "")
-BAN_AT = float(env.get("BAN_THRESHOLD", "0.9"))
-DELETE_AT = float(env.get("DELETE_THRESHOLD", "0.7"))
 TRUST_AFTER = int(env.get("TRUST_AFTER", "3"))
 DRY_RUN = env.get("DRY_RUN", "true").lower() in ("1", "true", "yes")
 DB_PATH = env.get("DB_PATH", "/data/antispam.db")
@@ -41,42 +41,6 @@ RULES_PATH = env.get("RULES_PATH", "/app/rules.txt")
 
 CLEF_URL = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/cloudflare/clef-flash"
 JEV_URL = "https://api.typesafe.ai/v1/systemone"
-
-SPAM_QUESTION = {
-    "is_spam": {
-        "type": "noul",
-        "instructions": (
-            "The `state` is a message posted in a Telegram group chat by a member who is not yet trusted. "
-            "Is this message spam? Spam includes: unsolicited advertising or self-promotion unrelated to the chat; "
-            "crypto, investment, betting or 'easy money' offers; suspicious job offers (remote work, high pay, "
-            "'write me in DM'); invitations to private messages, other channels or bots; adult or dating content; "
-            "phishing or scam links; mass-forwarded promotional posts. Not spam: ordinary conversation, questions, "
-            "opinions (even rude or off-topic), and links relevant to the discussion. "
-            "`author.bio` and `author.personal_channel` come from the author's Telegram profile. "
-            "If `message.image` is present, judge the attached image together with the text: an image is spam when "
-            "it advertises earnings, crypto, casinos or betting, adult content, or shows contact handles, phone "
-            "numbers or QR codes to lure people elsewhere. Ordinary photos, memes and screenshots relevant to the "
-            "chat are not spam."
-        ),
-    }
-}
-
-# Asked only of Jev: Clef scores these comments far too low to act on.
-NEURO_QUESTION = {
-    "is_neurocomment": {
-        "type": "noul",
-        "instructions": (
-            "The `state` is a comment in a Telegram channel discussion group. Is it 'neurocommenting'? That is a "
-            "generic, AI-written comment (smooth, emotional, restates or praises the post, no concrete personal "
-            "experience or question) posted by an account that promotes itself: its name, bio or personal channel "
-            "advertises services, teaching, courses, a business or a channel. Neurocommenting is used to get readers "
-            "to open the profile, so it is spam even when the text itself is on topic and polite. Answer no for "
-            "comments that share real personal experience, ask something specific or argue, or when the profile "
-            "advertises nothing."
-        ),
-    }
-}
-NEURO_SOURCE = "jev-neuro"
 
 # In dry-run nothing has been done yet, so the admin picks the action.
 DRY_RUN_BUTTONS = [("🗑 Удалить", "delete"), ("🔨 Удалить и забанить", "ban"),
@@ -125,6 +89,12 @@ def open_db() -> sqlite3.Connection:
             text TEXT, p_clef REAL, p_jev REAL, action TEXT);
         """
     )
+    # p_clef/p_jev held the old single spam probability; new rows store every answer.
+    for column in ("source TEXT", "answers TEXT"):
+        try:
+            conn.execute(f"ALTER TABLE actions ADD COLUMN {column}")
+        except sqlite3.OperationalError:  # already added
+            pass
     return conn
 
 
@@ -152,43 +122,56 @@ def set_trusted(chat_id: int, user_id: int) -> None:
     db.commit()
 
 
-def record(chat_id, user_id, text, p_clef, p_jev, action) -> None:
+def record(chat_id, user_id, text, source, answers, action) -> None:
     db.execute(
-        "INSERT INTO actions (ts, chat_id, user_id, text, p_clef, p_jev, action) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (int(time.time()), chat_id, user_id, text[:2000], p_clef, p_jev, action),
+        "INSERT INTO actions (ts, chat_id, user_id, text, source, answers, action) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (int(time.time()), chat_id, user_id, text[:2000], source,
+         json.dumps(answers) if answers is not None else None, action),
     )
     db.commit()
 
 
 # --- classifiers -------------------------------------------------------------
 
-def extract_probability(data: dict, question: str = "is_spam") -> float:
+def extract_answers(data: dict, ids) -> dict[str, float]:
+    """Noul probability per question id; raises if any answer is missing or malformed."""
     data = data.get("result", data)  # Cloudflare wraps the payload in {"result": ..., "success": ...}
-    answer = data["answers"][question]
-    if isinstance(answer, (int, float)):
-        return float(answer)
-    for key in ("noul", "probability", "p", "yes", "value"):
-        if isinstance(answer.get(key), (int, float)):
-            return float(answer[key])
-    raise ValueError(f"unexpected answer shape: {answer!r}")
+    out = {}
+    for qid in ids:
+        answer = data["answers"][qid]
+        if isinstance(answer, (int, float)):
+            out[qid] = float(answer)
+        elif isinstance(answer.get("noul"), (int, float)):
+            out[qid] = float(answer["noul"])
+        else:
+            raise ValueError(f"unexpected answer shape for {qid}: {answer!r}")
+    return out
 
 
-async def ask_clef(state: str, image: Image | None = None) -> dict:
-    body = {"model": "clef-flash", "questions": SPAM_QUESTION}
-    if image and image.mime in CLEF_MIMES:
+def payload(questions: dict) -> dict:
+    return {qid: q.payload() for qid, q in questions.items()}
+
+
+async def ask_clef(state: str, image: Image | None, has_text: bool, has_reply: bool) -> dict[str, float]:
+    sees_image = bool(image and image.mime in CLEF_MIMES)
+    questions = build_questions(has_text, has_reply, sees_image)
+    body = {"model": "clef-flash", "questions": payload(questions)}
+    if sees_image:
         body["images"] = [f"data:{image.mime};base64,{base64.b64encode(image.data).decode()}"]
         body["state"] = state.replace(IMAGE_PLACEHOLDER, "attached image (shown before the state)")
     else:
         body["state"] = state.replace(IMAGE_PLACEHOLDER, "image attached but not available for review")
     r = await http.post(CLEF_URL, headers={"Authorization": f"Bearer {CF_API_TOKEN}"}, json=body)
     r.raise_for_status()
-    return r.json()
+    return extract_answers(r.json(), questions)
 
 
-async def ask_jev(state: str, image: Image | None = None, questions: dict = SPAM_QUESTION) -> dict:
+async def ask_jev(state: str, image: Image | None, has_text: bool, has_reply: bool) -> dict[str, float]:
+    sees_image = bool(image and image.fits_jev())
+    questions = build_questions(has_text, has_reply, sees_image)
     headers = {"Authorization": f"Bearer {TYPESAFE_API_KEY}"}
-    body = {"model": JEV_MODEL, "questions": questions}
-    if image and image.fits_jev():
+    body = {"model": JEV_MODEL, "questions": payload(questions)}
+    if sees_image:
         ref = f"img-{uuid.uuid4()}"  # unique, so the reference cannot match other text in the state
         body["state"] = state.replace(IMAGE_PLACEHOLDER, ref)
         body["assets"] = {ref: {"type": "image", "format": JEV_FORMATS[image.mime],
@@ -198,7 +181,7 @@ async def ask_jev(state: str, image: Image | None = None, questions: dict = SPAM
         body["state"] = state.replace(IMAGE_PLACEHOLDER, "image attached but not available for review")
     r = await http.post(JEV_URL, headers=headers, json=body)
     r.raise_for_status()
-    return r.json()
+    return extract_answers(r.json(), questions)
 
 
 def pause_clef(response: httpx.Response) -> None:
@@ -215,11 +198,13 @@ def pause_clef(response: httpx.Response) -> None:
                 time.strftime("%Y-%m-%d %H:%M", time.gmtime(clef_paused_until)), response.text[:300])
 
 
-async def classify(state: str, image: Image | None = None) -> tuple[float, str] | None:
-    """Spam probability and the model that produced it; None if both failed."""
+async def classify(state: str, image: Image | None = None, has_text: bool = True,
+                   has_reply: bool = False) -> tuple[dict[str, float], str] | None:
+    """Answers to every question and the model that gave them; None if both failed.
+    A failed call is never read as "not spam": the caller leaves the message alone."""
     if time.time() >= clef_paused_until:
         try:
-            return extract_probability(await ask_clef(state, image)), "clef-flash"
+            return await ask_clef(state, image, has_text, has_reply), "clef-flash"
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429:
                 pause_clef(e.response)
@@ -228,20 +213,10 @@ async def classify(state: str, image: Image | None = None) -> tuple[float, str] 
         except Exception as e:  # timeouts, malformed answers: still fall back
             log.warning("clef-flash failed, falling back to jev: %s", e)
     try:
-        return extract_probability(await ask_jev(state, image)), "jev"
+        return await ask_jev(state, image, has_text, has_reply), "jev"
     except Exception as e:
         body = getattr(getattr(e, "response", None), "text", "")
         log.warning("jev failed: %s %s", e, body[:300])
-        return None
-
-
-async def classify_neurocomment(state: str) -> float | None:
-    """Probability that the message is neurocommenting; None if Jev failed."""
-    try:
-        return extract_probability(await ask_jev(state, questions=NEURO_QUESTION), "is_neurocomment")
-    except Exception as e:
-        body = getattr(getattr(e, "response", None), "text", "")
-        log.warning("jev neurocomment check failed: %s %s", e, body[:300])
         return None
 
 
@@ -318,58 +293,76 @@ async def fetch_image(bot: Bot, msg: Message) -> Image | None:
         return None
 
 
-def build_state(msg: Message, clean_count: int, edited: bool, image: Image | None = None,
-                profile: dict | None = None) -> str:
+def compact(d: dict) -> dict:
+    """Drop empty fields: the model can read an empty list or null as a signal."""
+    return {k: v for k, v in d.items() if v not in (None, "", [], {})}
+
+
+def replied_text(msg: Message) -> str | None:
+    """The channel post (or comment) this message answers, so `on_topic` has something to compare with."""
+    r = msg.reply_to_message
+    if not r:
+        return None
+    text = r.text or r.caption or ""
+    return text[:1500] or None
+
+
+def build_state(msg: Message, image: Image | None = None, profile: dict | None = None) -> str:
+    """Only what a person would look at to judge the message. Facts the code
+    already acts on (trust count, edits, CAS) stay out of it."""
     text = msg.text or msg.caption or ""
     entities = (msg.entities or []) + (msg.caption_entities or [])
-    links = [e.url or e.extract_from(text) for e in entities if e.type in ("url", "text_link")]
-    mentions = [e.extract_from(text) for e in entities if e.type == "mention"]
+    # Hidden link targets: a text_link's URL is not visible in the text itself.
+    hidden_links = [e.url for e in entities if e.type == "text_link" and e.url]
     u = msg.from_user
     forwarded = None
     if msg.forward_origin:
         origin = msg.forward_origin
         chat = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
         forwarded = chat.title if chat else origin.type
-    state = {
-        "platform": "Telegram group chat",
-        "group_title": msg.chat.title,
-        "group_description": GROUP_DESCRIPTION or None,
-        "author": {
+    reply = replied_text(msg)
+    state = compact({
+        "chat": compact({
+            "title": msg.chat.title,
+            "description": GROUP_DESCRIPTION,
+            "kind": "comments under posts of a Telegram channel",
+        }),
+        "author": compact({
             "name": u.full_name,
             "username": u.username,
-            "is_premium": bool(u.is_premium),
             "bio": (profile or {}).get("bio"),
             "personal_channel": (profile or {}).get("personal_channel"),
-            "earlier_clean_messages_in_group": clean_count,
-        },
-        "message": {
+        }),
+        "replying_to": {"text": reply} if reply else None,
+        "message": compact({
             "text": text[:4000],
-            "links": links,
-            "mentions": mentions,
+            "link_targets": hidden_links,
             "forwarded_from": forwarded,
-            "has_media": bool(msg.photo or msg.video or msg.document or msg.animation),
             "image": IMAGE_PLACEHOLDER if image else None,
-            "has_inline_buttons": bool(msg.reply_markup),
-            "is_edit_of_earlier_message": edited,
-        },
-    }
+        }),
+    })
     return json.dumps(state, ensure_ascii=False)
 
 
-async def report(bot: Bot, msg: Message, p: float, source: str, verdict: str, buttons: list[tuple[str, str]],
-                 has_image: bool = False) -> None:
+def explain(verdict: Verdict, answers: dict[str, float]) -> str:
+    """The answers behind a verdict, e.g. 'самопиар 92%, по теме 12%'."""
+    return ", ".join(f"{label(q)} {answers[q]:.0%}" for q in verdict.fired if q in answers)
+
+
+async def report(bot: Bot, msg: Message, verdict: Verdict, why: str, source: str, buttons: list[tuple[str, str]],
+                 has_image: bool = False, prompt: bool = False) -> None:
     u = msg.from_user
     who = f'<a href="tg://user?id={u.id}">{html.escape(u.full_name)}</a>'
     if u.username:
         who += f" @{html.escape(u.username)}"
     text = (
-        f"{'🧪 ТЕСТ: ' if DRY_RUN else ''}<b>{verdict}</b>\n"
+        f"{'🧪 ТЕСТ: ' if DRY_RUN and verdict.action != 'review' else ''}<b>{verdict.reason}</b>\n"
         f"Чат: {html.escape(msg.chat.title or str(msg.chat.id))}\n"
         f"Автор: {who} (<code>{u.id}</code>)\n"
-        f"Вероятность спама: {p:.0%} ({source})\n\n"
+        f"Признаки: {html.escape(why)} ({source})\n\n"
         + ("🖼 С картинкой\n" if has_image else "")
         + f"<blockquote>{html.escape((msg.text or msg.caption or '[без текста]')[:800])}</blockquote>"
-        + (DRY_RUN_PROMPT if DRY_RUN else "")
+        + (DRY_RUN_PROMPT if prompt else "")
     )
     keys = [InlineKeyboardButton(text=t, callback_data=f"{a}:{msg.chat.id}:{u.id}:{msg.message_id}")
             for t, a in buttons]
@@ -393,7 +386,7 @@ async def moderate(msg: Message, bot: Bot, edited: bool) -> None:
         return skip("bot or automatic forward")
     if await is_admin(bot, msg.chat.id, u.id):
         return skip("group admin")
-    clean_count, trusted = member(msg.chat.id, u.id)
+    _, trusted = member(msg.chat.id, u.id)
     if trusted:
         return skip("trusted member")
     text = msg.text or msg.caption or ""
@@ -402,54 +395,47 @@ async def moderate(msg: Message, bot: Bot, edited: bool) -> None:
     if not text and not msg.forward_origin and not has_visual:
         return skip("nothing to classify (service message, sticker, voice or file)")
 
-    image = None
+    image, answers = None, None
     if await in_cas(u.id):
-        p, source = 1.0, "CAS"
+        verdict, source, why = Verdict("ban", "Удалено и забанено (в базе CAS)"), "CAS", "аккаунт в базе CAS"
     else:
         image = await fetch_image(bot, msg) if has_visual else None
         profile = await fetch_profile(bot, u.id)
-        state = build_state(msg, clean_count, edited, image, profile)
-        result = await classify(state, image)
+        state = build_state(msg, image, profile)
+        result = await classify(state, image, has_text=bool(text), has_reply=replied_text(msg) is not None)
         if result is None:
             log.error("both classifiers failed; message %s in %s left untouched", msg.message_id, msg.chat.id)
             return
-        p, source = result
-        # Neurocomments look clean on their own; the advertising sits in the profile.
-        if p < DELETE_AT and text and (profile.get("bio") or profile.get("personal_channel")):
-            p_neuro = await classify_neurocomment(state)
-            log.info("neurocomment check: chat=%s msg=%s user=%s p=%s", msg.chat.id, msg.message_id, u.id, p_neuro)
-            if p_neuro is not None and p_neuro > p:
-                p, source = p_neuro, NEURO_SOURCE
+        answers, source = result
+        verdict = decide(answers)
+        why = explain(verdict, answers)
 
-    log.info("chat=%s msg=%s user=%s p=%.2f source=%s edited=%s image=%s",
-             msg.chat.id, msg.message_id, u.id, p, source, edited, image.mime if image else None)
+    log.info("chat=%s msg=%s user=%s action=%s source=%s edited=%s image=%s answers=%s",
+             msg.chat.id, msg.message_id, u.id, verdict.action, source, edited,
+             image.mime if image else None, json.dumps(answers))
 
-    # A neurocomment verdict rests on the profile, so it only deletes and leaves the ban to an admin.
-    if p >= BAN_AT and source != NEURO_SOURCE:
-        action = "ban"
-        if not DRY_RUN:
+    act = not DRY_RUN
+    if verdict.action == "ban":
+        if act:
             await bot.delete_message(msg.chat.id, msg.message_id)
             await bot.ban_chat_member(msg.chat.id, u.id, revoke_messages=True)
-        verdict = "Удалено и забанено" + (" (в базе CAS)" if source == "CAS" else "")
-        await report(bot, msg, p, source, verdict, DRY_RUN_BUTTONS if DRY_RUN else [("↩️ Разбанить", "unban")],
-                     has_image=bool(image))
-    elif p >= DELETE_AT:
-        action = "delete"
-        if not DRY_RUN:
+        await report(bot, msg, verdict, why, source,
+                     [("↩️ Разбанить", "unban")] if act else DRY_RUN_BUTTONS,
+                     has_image=bool(image), prompt=not act)
+    elif verdict.action == "delete":
+        if act:
             await bot.delete_message(msg.chat.id, msg.message_id)
-        verdict = "Удалено, похоже на нейрокомментинг (реклама в профиле)" if source == NEURO_SOURCE \
-            else "Удалено, похоже на спам"
-        await report(bot, msg, p, source, verdict,
-                     DRY_RUN_BUTTONS if DRY_RUN else [("🔨 Забанить", "ban"), ("✅ Не спам", "trust")],
-                     has_image=bool(image))
-    else:
-        action = "pass"
-        if not edited:
-            count_clean(msg.chat.id, u.id)
-    p_clef = p if source == "clef-flash" else None
-    p_jev = p if source in ("jev", NEURO_SOURCE) else None
-    record(msg.chat.id, u.id, text or ("[картинка]" if image else ""), p_clef, p_jev,
-           action + (" (dry-run)" if DRY_RUN and action != "pass" else ""))
+        await report(bot, msg, verdict, why, source,
+                     [("🔨 Забанить", "ban"), ("✅ Не спам", "trust")] if act else DRY_RUN_BUTTONS,
+                     has_image=bool(image), prompt=not act)
+    elif verdict.action == "review":
+        # Nothing is done automatically, in either mode: an admin decides.
+        await report(bot, msg, verdict, why, source, DRY_RUN_BUTTONS, has_image=bool(image), prompt=True)
+    elif not edited:
+        count_clean(msg.chat.id, u.id)
+    dry = DRY_RUN and verdict.action in ("ban", "delete")
+    record(msg.chat.id, u.id, text or ("[картинка]" if image else ""), source, answers,
+           verdict.action + (" (dry-run)" if dry else ""))
 
 
 @router.message(F.is_automatic_forward, F.chat.type == "supergroup")
@@ -505,15 +491,27 @@ async def check_media(msg: Message, bot: Bot) -> None:
         await msg.answer("Не удалось взять картинку: поддерживаются фото, картинки JPEG/PNG/WebP и превью видео или GIF.")
         return
     caption = (msg.caption or "").removeprefix("/check").strip()
-    state = json.dumps({"platform": "Telegram group chat", "group_description": GROUP_DESCRIPTION or None,
-                        "message": {"text": caption, "image": IMAGE_PLACEHOLDER}}, ensure_ascii=False)
-    result = await classify(state, image)
+    await msg.answer(await check_answer(caption, image))
+
+
+def test_state(text: str, image: Image | None) -> str:
+    return json.dumps(compact({
+        "chat": compact({"description": GROUP_DESCRIPTION, "kind": "comments under posts of a Telegram channel"}),
+        "message": compact({"text": text[:4000], "image": IMAGE_PLACEHOLDER if image else None}),
+    }), ensure_ascii=False)
+
+
+async def check_answer(text: str, image: Image | None = None) -> str:
+    """Every answer and the verdict, for admins testing the classifier."""
+    result = await classify(test_state(text, image), image, has_text=bool(text))
     if result is None:
-        await msg.answer("Обе модели не ответили, подробности в логах.")
-        return
-    p, source = result
-    verdict = "бан" if p >= BAN_AT else "удаление" if p >= DELETE_AT else "пропуск"
-    await msg.answer(f"Вероятность спама: <b>{p:.0%}</b> ({source})\nРешение: {verdict}")
+        return "Обе модели не ответили, подробности в логах."
+    answers, source = result
+    verdict = decide(answers)
+    lines = [f"{'• ' if q in verdict.fired else '  '}{html.escape(label(q))}: {p:.0%}"
+             for q, p in sorted(answers.items(), key=lambda kv: -kv[1])]
+    return (f"Решение: <b>{verdict.action}</b> {html.escape(verdict.reason)} ({source})\n"
+            "<pre>" + "\n".join(lines) + "</pre>")
 
 
 @router.message(Command("check"), F.chat.type == "private")
@@ -525,15 +523,7 @@ async def check(msg: Message) -> None:
     if not text:
         await msg.answer("Напишите текст после команды: <code>/check текст сообщения</code>")
         return
-    state = json.dumps({"platform": "Telegram group chat", "group_description": GROUP_DESCRIPTION or None,
-                        "message": {"text": text[:4000]}}, ensure_ascii=False)
-    result = await classify(state)
-    if result is None:
-        await msg.answer("Обе модели не ответили, подробности в логах.")
-        return
-    p, source = result
-    verdict = "бан" if p >= BAN_AT else "удаление" if p >= DELETE_AT else "пропуск"
-    await msg.answer(f"Вероятность спама: <b>{p:.0%}</b> ({source})\nРешение: {verdict}")
+    await msg.answer(await check_answer(text))
 
 
 @router.message(Command("stats"), F.chat.type == "private")
@@ -602,27 +592,25 @@ async def selftest(text: str, image_path: str | None = None) -> None:
     is attached to the message."""
     global ask_clef
     image = None
-    message = {"text": text}
     if image_path:
         with open(image_path, "rb") as f:
             data = f.read()
         mime = "image/png" if data[:4] == b"\x89PNG" else "image/jpeg"
         width, height = map(int, sys.argv[4].split("x")) if len(sys.argv) > 4 else (0, 0)
         image = Image(data, mime, width, height)
-        message["image"] = IMAGE_PLACEHOLDER
         print(f"image: {mime} {width}x{height} {len(data)} bytes, jev accepts: {image.fits_jev()}")
-    state = json.dumps({"platform": "Telegram group chat", "message": message}, ensure_ascii=False)
-    print("normal:", await classify(state, image))
+    state = test_state(text, image)
+    print("normal:", await classify(state, image, has_text=bool(text)))
 
-    async def exhausted_clef(_state: str, _image: Image | None = None) -> dict:
+    async def exhausted_clef(*_args) -> dict:
         request = httpx.Request("POST", CLEF_URL)
         body = {"errors": [{"code": 4006, "message": "you have used up your daily free allocation of 10,000 neurons"}]}
         raise httpx.HTTPStatusError("429", request=request, response=httpx.Response(429, json=body, request=request))
 
     real_clef, ask_clef = ask_clef, exhausted_clef
-    print("clef out of quota:", await classify(state, image))
+    print("clef out of quota:", await classify(state, image, has_text=bool(text)))
     ask_clef = real_clef
-    print("while paused:", await classify(state, image), "| clef paused until",
+    print("while paused:", await classify(state, image, has_text=bool(text)), "| clef paused until",
           time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(clef_paused_until)))
 
 
@@ -637,8 +625,8 @@ async def main() -> None:
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
     dp.include_router(router)
-    log.info("starting: dry_run=%s ban_at=%s delete_at=%s trust_after=%s cas=%s admins=%s",
-             DRY_RUN, BAN_AT, DELETE_AT, TRUST_AFTER, "on" if CAS_API_KEY else "off (no CAS_API_KEY)",
+    log.info("starting: dry_run=%s trust_after=%s cas=%s admins=%s",
+             DRY_RUN, TRUST_AFTER, "on" if CAS_API_KEY else "off (no CAS_API_KEY)",
              sorted(ADMIN_IDS))
     await dp.start_polling(bot, allowed_updates=["message", "edited_message", "callback_query"])
 
